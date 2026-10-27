@@ -1,2 +1,5 @@
 CLAUDE.md
 .venv
+results*/
+*.zip
+__pycache__/
