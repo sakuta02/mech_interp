@@ -1,135 +1,117 @@
-"""Построение векторов: калибровка состояний слотов, вектор роли слота, контрольные векторы и их геометрия."""
+"""Построение векторов опыта: калибровка состояний слотов 1, 3, 5, вектор перехода o -> d для каждого инструмента,
+вектор тех же переходов по остальным инструментам («неродной»), контрольные векторы и их геометрия."""
 import json, random
 from dataclasses import dataclass
 import pandas as pd, torch
 
-from data import TOOLS, TEMPLATES, LAYOUTS
-from prompts import tf_ids
-
-SIGMA = {"od": 1.0, "do": -1.0}
+from data import TOOLS, TEMPLATES, TRANSITIONS, SLOTS, sample_vals
+from prompts import call_ids
 
 
 @dataclass
 class Vectors:
-    """Построенные векторы, формы [L, d] (norm_s — [L, 1]): s — роль без позиции; D_cfg — по (порядок ключей, вариант вызова);
-    e_lay — часть, зависящая от порядка; dom_vec — по типу задач; d_shuf — контроль с обменом меток; per_tool — по инструменту.
-    """
-    s: torch.Tensor
-    norm_s: torch.Tensor
-    D_cfg: dict
-    e_lay: dict
-    dom_vec: dict
-    d_shuf: torch.Tensor
-    per_tool: dict
+    """Векторы переходов, формы [L, d]: native — свой вектор перехода (инструмент, (o, d));
+    foreign — тот же переход по всем остальным инструментам; shuf — контроль с обменом меток, без проекции на native."""
+    native: dict
+    foreign: dict
+    shuf: dict
 
 
 def calibrate(lm, cfg, t, n, pool):
-    """Состояния слотов origin и destination инструмента при teacher forcing: ([kept, L, d], [kept, L, d]).
-    При FILTER_CALIB остаются примеры, где модель верна в обоих слотах.
-    """
-    tpls = [x for x in TEMPLATES if x["domain"] == t["domain"] and x["split"] == "calib"]
-    pool = pool[t["domain"]]["calib"]
-    Ho, Hd = [], []
+    """Состояния слотов 1, 3 и 5 инструмента при teacher forcing: {k: [kept, L, d]}.
+    При FILTER_CALIB остаются примеры, где модель верна во всех трёх слотах."""
+    tpls = [x for x in TEMPLATES if x["split"] == "calib"]
+    out = {k: [] for k in SLOTS}
     for i in range(n):
-        O, D, X = random.sample(pool, 3)
-        ids, pos = tf_ids(lm, t, tpls[i % len(tpls)], O, D, X)
-        logits, st = lm.run_states(ids, pos)
-        tgt = {"o": lm.enc(O)[0], "d": lm.enc(D)[0]}
-        if cfg.FILTER_CALIB and any(logits[pos[r]].argmax().item() != tgt[r] for r in "od"):
+        vals = sample_vals(t, pool, "calib")
+        ids, pos = call_ids(lm, t, tpls[i % len(tpls)], vals)
+        logits, st = lm.run_states(lm.tensor(ids), {k: pos[k] for k in SLOTS})
+        if cfg.FILTER_CALIB and any(logits[pos[k]].argmax().item() != lm.enc(vals[k])[0] for k in SLOTS):
             continue
-        Ho.append(st["o"]); Hd.append(st["d"])
-    assert Ho, f"{t['id']}: все калибровочные примеры отфильтрованы"
-    return torch.stack(Ho), torch.stack(Hd)
+        for k in SLOTS:
+            out[k].append(st[k])
+    assert out[SLOTS[0]], f"{t['id']}: все калибровочные примеры отфильтрованы"
+    return {k: torch.stack(v) for k, v in out.items()}
 
 
 def collect(lm, cfg, pool, log):
-    """Калибровка всех инструментов."""
+    """Калибровка всех инструментов: {id инструмента: {слот: [kept, L, d]}}."""
     H = {}
     for i, t in enumerate(TOOLS):
         H[t["id"]] = calibrate(lm, cfg, t, cfg.N_PER_TOOL, pool)
-        log(f"калибровка {i + 1}/{len(TOOLS)}: {t['id']}, осталось примеров {H[t['id']][0].shape[0]}/{cfg.N_PER_TOOL}")
+        log(f"калибровка {i + 1}/{len(TOOLS)}: {t['id']}, осталось примеров {H[t['id']][SLOTS[0]].shape[0]}/{cfg.N_PER_TOOL}")
     return H
 
 
-role_vec = lambda Ho, Hd: Hd.mean(0) - Ho.mean(0)
+def pooled(H, tool_ids, o, d):
+    """Вектор перехода o -> d по объединённым примерам инструментов: среднее состояние слота d минус слота o."""
+    return torch.cat([H[i][d] for i in tool_ids]).mean(0) - torch.cat([H[i][o] for i in tool_ids]).mean(0)
 
 
-def unit(v, norm_s):
-    """Вектор v с нормой ||s|| на каждом слое."""
-    return v / v.norm(dim=-1, keepdim=True) * norm_s
+def unit(v, ref):
+    """Направление v с нормой ref на каждом слое."""
+    return v / v.norm(dim=-1, keepdim=True) * ref.norm(dim=-1, keepdim=True)
 
 
-def rand_unit(seed, s, norm_s):
-    """Случайный вектор формы s и нормы ||s|| по seed."""
-    g = torch.Generator(device=s.device).manual_seed(seed)
-    return unit(torch.randn(s.shape, generator=g, device=s.device), norm_s)
+def rand_unit(seed, ref):
+    """Случайное направление формы ref с нормой ref по seed."""
+    g = torch.Generator(device=ref.device).manual_seed(seed)
+    return unit(torch.randn(ref.shape, generator=g, device=ref.device), ref)
 
 
 def build_vectors(H):
-    """Все векторы по калибровочным состояниям H."""
-    def pooled(ids_):
-        """Вектор роли по набору инструментов: среднее состояние второго слота минус первого."""
-        return role_vec(torch.cat([H[i][0] for i in ids_]), torch.cat([H[i][1] for i in ids_]))
-
-    FL = [t for t in TOOLS if t["domain"] == "flight"]
-    D_cfg = {(o, lay): pooled([t["id"] for t in FL if t["split"] == "calib" and t["order"] == o and t["layout"] == lay])
-             for o in ("od", "do") for lay in LAYOUTS}
-    s = torch.stack(list(D_cfg.values())).mean(0)
-    e_lay = {lay: (D_cfg[("od", lay)] - D_cfg[("do", lay)]) / 2 for lay in LAYOUTS}
-    dom_vec = {dom: pooled([t["id"] for t in TOOLS if t["domain"] == dom]) for dom in ("message", "period")}
-    norm_s = s.norm(dim=-1, keepdim=True)
-
-    cal_ids = [t["id"] for t in FL if t["split"] == "calib"]
-    Ho_all = torch.cat([H[i][0] for i in cal_ids]); Hd_all = torch.cat([H[i][1] for i in cal_ids])
-    n_all = Ho_all.shape[0]
-    mask = torch.zeros(n_all, dtype=torch.bool, device=Ho_all.device)
-    mask[torch.randperm(n_all, device=Ho_all.device)[: n_all // 2]] = True
-    m = mask[:, None, None]
-    d_shuf = torch.where(m, Ho_all, Hd_all).mean(0) - torch.where(m, Hd_all, Ho_all).mean(0)
-    c = s / norm_s
-    d_shuf = d_shuf - (d_shuf * c).sum(-1, keepdim=True) * c
-
-    return Vectors(s=s, norm_s=norm_s, D_cfg=D_cfg, e_lay=e_lay, dom_vec=dom_vec, d_shuf=d_shuf,
-                   per_tool={k: role_vec(*v) for k, v in H.items()})
+    """Свои, неродные и перемешанные векторы для каждой пары (инструмент, переход)."""
+    ids = list(H)
+    native = {(i, tr): pooled(H, [i], *tr) for i in ids for tr in TRANSITIONS}
+    foreign = {(i, tr): pooled(H, [j for j in ids if j != i], *tr) for i in ids for tr in TRANSITIONS}
+    shuf = {}
+    for i in ids:
+        n = H[i][SLOTS[0]].shape[0]
+        mask = torch.zeros(n, dtype=torch.bool, device=H[i][SLOTS[0]].device)
+        mask[torch.randperm(n, device=mask.device)[: n // 2]] = True
+        m = mask[:, None, None]
+        for tr in TRANSITIONS:
+            Ho, Hd = H[i][tr[0]], H[i][tr[1]]
+            ds = torch.where(m, Ho, Hd).mean(0) - torch.where(m, Hd, Ho).mean(0)
+            c = native[(i, tr)] / native[(i, tr)].norm(dim=-1, keepdim=True)
+            shuf[(i, tr)] = ds - (ds * c).sum(-1, keepdim=True) * c
+    return Vectors(native=native, foreign=foreign, shuf=shuf)
 
 
-def build_vecs_by_tool(cfg, V):
-    """Для каждого инструмента список (условие, вектор, силы)."""
-    s, ns = V.s, V.norm_s
-    common_ctrl = [("steer_neg", -unit(s, ns), cfg.CTRL_ALPHAS), ("shuffled", unit(V.d_shuf, ns), cfg.CTRL_ALPHAS),
-                   ("random0", rand_unit(0, s, ns), cfg.CTRL_ALPHAS), ("random1", rand_unit(1, s, ns), cfg.CTRL_ALPHAS)]
+def build_vecs(cfg, V):
+    """Для каждой пары (инструмент, переход) список (условие, вид, вектор, силы); все векторы с нормой своего native."""
     out = {}
     for t in TOOLS:
-        o, lay = t["order"], t["layout"]
-        opp = "do" if o == "od" else "od"
-        v = [("steer",      unit(s, ns),                          cfg.ALPHAS),   # роль без позиции (вектор рейсов)
-             ("steer_same", unit(V.D_cfg[(o, lay)], ns),          cfg.ALPHAS),   # тот же порядок и вариант вызова
-             ("steer_opp",  unit(V.D_cfg[(opp, lay)], ns),        cfg.ALPHAS),   # противоположный порядок
-             ("steer_tool", unit(V.per_tool[t["id"]], ns),        cfg.ALPHAS)]   # вектор самого инструмента
-        if t["domain"] == "flight":
-            others = [l for l in LAYOUTS if l != lay]
-            v += [("steer_layout", unit(torch.stack([V.D_cfg[(o, l)] for l in others]).mean(0), ns), cfg.ALPHAS),  # другие варианты вызова
-                  ("steer_pos",    unit(SIGMA[o] * V.e_lay[lay], ns), cfg.ALPHAS)]                                # позиция без роли
-        else:
-            v += [("steer_dom", unit(V.dom_vec[t["domain"]], ns), cfg.ALPHAS)]      # вектор самого типа задач (контроль)
-        out[t["id"]] = v + common_ctrl
+        for tr in TRANSITIONS:
+            o, d = tr
+            ref = V.native[(t["id"], tr)]
+            out[(t["id"], tr)] = [
+                (f"steer_tool_{o}_{d}",    "steer_tool",    ref,                                 cfg.ALPHAS),        # свой вектор перехода
+                (f"steer_foreign_{o}_{d}", "steer_foreign", unit(V.foreign[(t["id"], tr)], ref), cfg.ALPHAS),        # тот же переход по остальным инструментам
+                ("steer_neg", "steer_neg", -ref,                                                 cfg.CTRL_ALPHAS),   # контроли
+                ("shuffled",  "shuffled",  unit(V.shuf[(t["id"], tr)], ref),                     cfg.CTRL_ALPHAS),
+                ("random0",   "random",    rand_unit(0, ref),                                   cfg.CTRL_ALPHAS),
+                ("random1",   "random",    rand_unit(1, ref),                                   cfg.CTRL_ALPHAS)]
     return out
 
 
 def geometry(cfg, V):
-    """Нормы и косинусы между векторами по слоям LAYER_RANGE."""
+    """По слоям LAYER_RANGE: норма вектора, согласие векторов разных инструментов и косинус native с foreign."""
     cos = lambda a, b: torch.cosine_similarity(a, b, dim=0).item()
+    ids, K = [t["id"] for t in TOOLS], len(TOOLS)
+    fwd = [tr for tr in TRANSITIONS if tr[0] < tr[1]]
     geom = []
     for l in cfg.LAYER_RANGE:
-        r = dict(layer=l, norm_s=V.s[l].norm().item(), cos_shuf_s=cos(V.d_shuf[l], V.s[l]))
-        for lay in LAYOUTS:
-            r[f"cos_od_do[{lay}]"] = cos(V.D_cfg[("od", lay)][l], V.D_cfg[("do", lay)][l])
-            r[f"e_over_s[{lay}]"] = V.e_lay[lay][l].norm().item() / V.s[l].norm().item()
-        for o in ("od", "do"):
-            for a, b in [("none", "date_mid"), ("none", "date_first"), ("date_mid", "date_first")]:
-                r[f"cos_{o}[{a}~{b}]"] = cos(V.D_cfg[(o, a)][l], V.D_cfg[(o, b)][l])
-        for dom in V.dom_vec:
-            r[f"cos_dom[{dom}~s]"] = cos(V.dom_vec[dom][l], V.s[l])
+        r = dict(layer=l)
+        for tr in fwd:
+            k = f"{tr[0]}>{tr[1]}"
+            vs = torch.stack([V.native[(i, tr)][l] for i in ids])
+            vn = vs / vs.norm(dim=-1, keepdim=True)
+            r[f"norm[{k}]"] = vs.norm(dim=-1).mean().item()
+            r[f"cos_tools[{k}]"] = ((vn @ vn.T).sum().item() - K) / (K * (K - 1))
+            r[f"cos_foreign[{k}]"] = sum(cos(V.native[(i, tr)][l], V.foreign[(i, tr)][l]) for i in ids) / K
+        for a, b in zip(fwd, fwd[1:]):
+            r[f"cos_trans[{a[0]}>{a[1]}~{b[0]}>{b[1]}]"] = sum(cos(V.native[(i, a)][l], V.native[(i, b)][l]) for i in ids) / K
         geom.append(r)
     return pd.DataFrame(geom).round(3).set_index("layer")
 
@@ -139,11 +121,9 @@ def save_artifacts(cfg, V, H, pool, geom, log):
     out = cfg.OUT_DIR
     geom.to_csv(f"{out}/vector_geometry.csv")
     print(geom.T.to_string())
-    torch.save({"D_cfg": {f"{k[0]}|{k[1]}": v.cpu() for k, v in V.D_cfg.items()}, "s": V.s.cpu(),
-                "e_lay": {k: v.cpu() for k, v in V.e_lay.items()}, "dom_vec": {k: v.cpu() for k, v in V.dom_vec.items()},
-                "d_shuf": V.d_shuf.cpu(), "per_tool": {k: v.cpu() for k, v in V.per_tool.items()}},
-               f"{out}/vectors.pt")
-    json.dump(dict(vars(cfg), POOL=pool, kept_calib={k: int(v[0].shape[0]) for k, v in H.items()}),
+    pack = lambda d: {f"{k[0]}|{k[1][0]}>{k[1][1]}": v.cpu() for k, v in d.items()}
+    torch.save({"native": pack(V.native), "foreign": pack(V.foreign), "shuf": pack(V.shuf)}, f"{out}/vectors.pt")
+    json.dump(dict(vars(cfg), POOL=pool, kept_calib={k: int(v[SLOTS[0]].shape[0]) for k, v in H.items()}),
               open(f"{out}/config.json", "w"), indent=1,
               default=lambda r: [r.start, r.stop] if isinstance(r, range) else str(r))
     log("векторы построены, геометрия и векторы сохранены")

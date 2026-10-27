@@ -1,7 +1,9 @@
-"""Опыт steering: есть ли в активациях модели направление «роль слота».
+"""Опыт steering: зависит ли успех стиринга от номера аргумента и от семантики значений.
 
-Модель вызывает инструмент с двумя однотипными слотами (например, origin и destination). Опыт строит вектор роли по состояниям модели
-перед записью значений и проверяет, что его добавка перед слотом заставляет модель записать значение другого слота.
+Пять инструментов по пять аргументов, у каждого аргумента своя семантика (имя, город, цвет, профессия и т. д.). Для переходов
+1→3, 3→5, 5→3 и 3→1 строится вектор «перенести значение аргумента o в слот аргумента d» по состояниям модели перед записью значений;
+проверяется, что его добавка перед слотом o заставляет модель записать значение аргумента d. Вектор каждого инструмента сравнивается
+с вектором того же перехода, посчитанным по остальным инструментам, и с контролями.
 
     python main.py --test    быстрый прогон и проверка всех функций (итог: OK/FAIL)
     python main.py --run     полный прогон
@@ -25,7 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 def parse_args():
     """Разбирает флаги командной строки."""
-    ap = argparse.ArgumentParser(description="Опыт steering: вектор роли слота инструмента")
+    ap = argparse.ArgumentParser(description="Опыт steering: стиринг между аргументами 1, 3, 5 в инструментах с разной семантикой")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--test", action="store_true", help="быстрый прогон и проверки всех функций")
     mode.add_argument("--run", action="store_true", help="полный прогон")
@@ -64,7 +66,7 @@ def main():
     torch.set_grad_enabled(False)
 
     lm = LM(cfg, log)
-    pool = build_pools(lm, cfg, log)
+    pool = build_pools(lm, log)
     probe_format(lm, log)
     if ck:
         checks.check_data(ck, lm, pool)
@@ -73,11 +75,11 @@ def main():
 
     H = vectors.collect(lm, cfg, pool, log)
     V = vectors.build_vectors(H)
-    vecs = vectors.build_vecs_by_tool(cfg, V)
+    vecs = vectors.build_vecs(cfg, V)
     geom = vectors.geometry(cfg, V)
     vectors.save_artifacts(cfg, V, H, pool, geom, log)
     if ck:
-        checks.check_vectors(ck, cfg, lm, H, V, vecs)
+        checks.check_vectors(ck, cfg, H, V, vecs)
         checks.check_eval(ck, lm, cfg, vecs, pool)
 
     df = run_all(lm, cfg, vecs, pool, log)

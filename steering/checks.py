@@ -1,14 +1,15 @@
-"""Проверки режима --test: на каждом этапе опыта проверяют формы, нормы, работу хуков и итоговые файлы и пишут в лог OK, FAIL или WARN."""
+"""Проверки режима --test для опыта: на каждом этапе проверяют формы, нормы, работу хуков и итоговые файлы
+и пишут в лог OK, FAIL или WARN. Глобальный random не трогают: используют локальный Random."""
 import os, random
 from dataclasses import replace
 import pandas as pd, torch
 
 import analysis, plots
-from data import TOOLS, TEMPLATES, LAYOUTS
+from data import N_ARGS, TOOLS, TEMPLATES, TRANSITIONS, SLOTS, TYPE_CANDIDATES, sample_vals
 from evaluate import eval_example
 from model import RESID, steer
-from prompts import arg_seq, tf_ids, prefix, probe_format
-from vectors import rand_unit
+from prompts import call_ids, render_user, probe_format
+from vectors import rand_unit, pooled
 
 
 class Checker:
@@ -38,140 +39,154 @@ class Checker:
 
 def check_data(ck, lm, pool):
     """Проверяет набор инструментов, шаблоны и пулы значений."""
-    ck("44 инструмента (36 рейсов + 4 письма + 4 периода)", len(TOOLS) == 44, f"{len(TOOLS)}")
+    ck("5 инструментов по 5 аргументов", len(TOOLS) == 5 and all(len(t["args"]) == N_ARGS for t in TOOLS))
+    ck("переходы: 1→3, 3→5, 5→3, 3→1", TRANSITIONS == [(1, 3), (3, 5), (5, 3), (3, 1)])
+    ck("слоты для векторов: 1, 3, 5", SLOTS == [1, 3, 5])
+    ck("внутри инструмента типы всех аргументов различны", all(len({a["type"] for a in t["args"]}) == N_ARGS for t in TOOLS))
+    ck("внутри инструмента ключи аргументов различны", all(len({a["key"] for a in t["args"]}) == N_ARGS for t in TOOLS))
+    t135 = [t["args"][k - 1]["type"] for t in TOOLS for k in SLOTS]
+    ck("на позициях 1, 3, 5 стоят 15 разных типов", len(set(t135)) == 15, f"{len(set(t135))}")
+    ck("есть инструмент, где имя и город стоят на слотах 1, 3, 5 (имя ← пункт назначения)",
+       any({"name", "city"} <= {t["args"][k - 1]["type"] for k in SLOTS} for t in TOOLS))
     ck("id инструментов уникальны", len({t["id"] for t in TOOLS}) == len(TOOLS))
-    ck("в каждом шаблоне есть {O} и {D}", all("{O}" in x["text"] and "{D}" in x["text"] for x in TEMPLATES))
-    for dom in ("flight", "message", "period"):
-        ck(f"{dom}: есть калибровочные и тестовые шаблоны",
-           {x["split"] for x in TEMPLATES if x["domain"] == dom} == {"calib", "test"})
-        ck(f"{dom}: пулы калибровки и теста не пересекаются", not set(pool[dom]["calib"]) & set(pool[dom]["test"]))
-        ck(f"{dom}: все значения пула однотокенные", all(len(lm.enc(v)) == 1 for k in ("calib", "test") for v in pool[dom][k]))
-        ck(f"{dom}: в пуле хватает значений для random.sample(3)", min(len(pool[dom]["calib"]), len(pool[dom]["test"])) >= 3)
+    ck("шаблоны: есть calib и test, fwd и rev", {x["split"] for x in TEMPLATES} == {"calib", "test"}
+       and {x["rev"] for x in TEMPLATES} == {True, False})
+    used = {a["type"] for t in TOOLS for a in t["args"]}
+    ck("пулы построены для всех используемых типов", used <= set(pool) <= set(TYPE_CANDIDATES))
+    flat = [v for ty in pool for k in ("calib", "test") for v in pool[ty][k]]
+    toks = [lm.enc(v)[0] for v in flat]
+    ck("все значения пулов однотокенные", all(len(lm.enc(v)) == 1 for v in flat))
+    ck("токены значений не повторяются ни внутри типа, ни между типами", len(set(toks)) == len(toks), f"{len(toks) - len(set(toks))} повторов")
+    ck("калибровочный и тестовый пулы каждого типа не пересекаются", all(not set(pool[ty]["calib"]) & set(pool[ty]["test"]) for ty in pool))
+    low = min(len(pool[ty][k]) for ty in pool for k in ("calib", "test"))
+    ck("в каждом пуле не меньше 4 значений", low >= 4, f"минимум {low}")
 
 
 def check_prompts(ck, lm, pool):
-    """Проверяет сборку промптов: позиции слотов и согласованность prefix с teacher forcing."""
-    bad_pos, bad_pref, bad_role, n = 0, 0, 0, 0
+    """Проверяет сборку промптов: позиции слотов, обрезку upto и порядок значений в шаблонах."""
+    bad_pos, bad_cut, n = 0, 0, 0
     for t in TOOLS:
-        for tpl in (x for x in TEMPLATES if x["domain"] == t["domain"]):
-            O, D, X = pool[t["domain"]]["calib"][:3]
-            ids, pos = tf_ids(lm, t, tpl, O, D, X)
-            seq = [int(v) for v in ids[0]]
+        for tpl in TEMPLATES:
+            vals = {k: pool[a["type"]]["calib"][0] for k, a in enumerate(t["args"], 1)}
+            ids, pos = call_ids(lm, t, tpl, vals)
             n += 1
-            bad_pos += any(seq[pos[r] + 1] != lm.enc({"o": O, "d": D}[r])[0] for r in pos)
-            roles = [r for r, _ in arg_seq(t) if r != "x"]
-            p1, role1, tok1 = prefix(lm, t, tpl, O, D, X, "first")
-            bad_pref += p1 != seq[:pos[role1] + 1] or tok1 is not None
-            bad_role += role1 != roles[0]
-    ck(f"tf_ids: токен после pos[роль] совпадает со значением ({n} комбинаций)", bad_pos == 0, f"ошибок {bad_pos}")
-    ck("prefix(first) совпадает с префиксом teacher forcing", bad_pref == 0, f"ошибок {bad_pref}")
-    ck("prefix(first): роль равна роли первого города вызова", bad_role == 0, f"ошибок {bad_role}")
-    t = next(t for t in TOOLS if t["layout"] == "date_mid")
-    ck("date_mid: дата между двумя городами", [r for r, _ in arg_seq(t)][1] == "x")
-    ck("date_first: дата первой", [r for r, _ in arg_seq(next(t for t in TOOLS if t["layout"] == "date_first"))][0] == "x")
+            bad_pos += any(ids[pos[k] + 1] != lm.enc(vals[k])[0] for k in range(1, N_ARGS + 1))
+            for k in range(1, N_ARGS + 1):
+                cut, pc = call_ids(lm, t, tpl, vals, upto=k)
+                bad_cut += cut != ids[:pos[k] + 1] or pc[k] != pos[k] or len(cut) != pos[k] + 1
+    ck(f"call_ids: токен после pos[k] — значение аргумента k ({n} комбинаций)", bad_pos == 0, f"ошибок {bad_pos}")
+    ck("call_ids(upto=k) совпадает с началом полного вызова", bad_cut == 0, f"ошибок {bad_cut}")
+    t = TOOLS[0]
+    vals = {k: pool[a["type"]]["calib"][0] for k, a in enumerate(t["args"], 1)}
+    fwd = render_user(t, next(x for x in TEMPLATES if x["id"] == "kv_fwd"), vals)
+    rev = render_user(t, next(x for x in TEMPLATES if x["id"] == "kv_rev"), vals)
+    first, last = t["args"][0]["label"], t["args"][-1]["label"]
+    ck("шаблон fwd перечисляет аргументы 1..5, rev — 5..1", fwd.index(first) < fwd.index(last) and rev.index(first) > rev.index(last))
+    ck("в сообщении пользователя есть все пять значений", all(v in fwd for v in vals.values()))
 
 
 def check_model(ck, lm, cfg, pool):
     """Проверяет чтение активаций хуком и правку активаций хуками на загруженной модели."""
     t, tpl = TOOLS[0], TEMPLATES[0]
-    O, D, X = pool["flight"]["calib"][:3]
-    ids, pos = tf_ids(lm, t, tpl, O, D, X)
-    T = ids.shape[1]
-    logits, st = lm.run_states(ids, pos)
-    ck("run_states: логиты [T, V]", logits.shape[0] == T and logits.ndim == 2, f"{tuple(logits.shape)}")
-    ck("run_states: состояния [слои, d] для o и d", all(v.shape[0] == lm.n_layers and v.ndim == 2 for v in st.values())
-       and set(st) == {"o", "d"}, f"{ {r: tuple(v.shape) for r, v in st.items()} }")
+    vals = sample_vals(t, pool, "calib", random.Random(1))
+    ids, pos = call_ids(lm, t, tpl, vals)
+    logits, st = lm.run_states(lm.tensor(ids), {k: pos[k] for k in SLOTS})
+    ck("run_states: логиты [T, V]", logits.shape[0] == len(ids) and logits.ndim == 2, f"{tuple(logits.shape)}")
+    ck("run_states: состояния [слои, d] для слотов 1, 3, 5", set(st) == set(SLOTS) and all(v.shape[0] == lm.n_layers and v.ndim == 2 for v in st.values()),
+       f"{ {k: tuple(v.shape) for k, v in st.items()} }")
     ck("run_states: нет NaN/inf", all(torch.isfinite(v).all().item() for v in st.values()))
-    _, cache = lm.model.run_with_cache(ids, names_filter=[RESID(l) for l in range(lm.n_layers)])
+    _, cache = lm.model.run_with_cache(lm.tensor(ids), names_filter=[RESID(l) for l in range(lm.n_layers)])
     ck("читающий хук даёт те же активации, что run_with_cache (бит в бит)",
-       all(torch.equal(st[r], torch.stack([cache[RESID(l)][0, p] for l in range(lm.n_layers)]).float()) for r, p in pos.items()))
-    ck("run_states(logits=False) не считает логиты", lm.run_states(ids, {"o": 0}, logits=False)[0] is None)
+       all(torch.equal(st[k], torch.stack([cache[RESID(l)][0, pos[k]] for l in range(lm.n_layers)]).float()) for k in SLOTS))
+    ck("run_states(logits=False) не считает логиты", lm.run_states(lm.tensor(ids), {1: 0}, logits=False)[0] is None)
 
-    x = lm.tensor(prefix(lm, t, tpl, O, D, X, "first")[0])
+    ids3, _ = call_ids(lm, t, tpl, vals, upto=3)
+    x = lm.tensor(ids3)
     base = lm.fwd_last(x)
     l = cfg.L0
     d = lambda a, b: (a - b).abs().max().item()
     ck("fwd_last: форма [1, V]", base.ndim == 2 and base.shape[0] == 1, f"{tuple(base.shape)}")
-    _, stx = lm.run_states(x, {"p": x.shape[1] - 1})
     dl = d(lm.model(x)[0, -1][None].float(), base)
     ck("model(x) и fwd_last согласованы по последней позиции", dl < 0.5, f"макс. разница логитов {dl:.3f}")
-
-    zero = torch.zeros(1, stx["p"].shape[-1], device=lm.device)
+    stx = lm.run_states(x, {"p": x.shape[1] - 1}, logits=False)[1]["p"]
+    zero = torch.zeros(1, stx.shape[-1], device=lm.device)
     ck("хук steer(adds=0) не меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(adds=zero))]), base) < 1e-3)
-    ck("хук steer(adds=вектор) меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(adds=stx["p"][l][None] * 0.5))]), base) > 0)
+    ck("хук steer(adds=вектор) меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(adds=stx[l][None] * 0.5))]), base) > 0)
     ck("хуки снимаются после прогона", d(lm.fwd_last(x), base) < 1e-3)
-    ck("подмена собственной активацией (repl) не меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(repl=stx["p"][l]))]), base) < 1e-3)
+    ck("подмена собственной активацией (repl) не меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(repl=stx[l]))]), base) < 1e-3)
     lg3 = lm.fwd_last(x.repeat(3, 1))
-    ck("батч из одинаковых строк даёт те же логиты, что одна строка", max(d(lg3[i:i + 1], base) for i in range(3)) < 1.0,
-       f"макс. разница {max(d(lg3[i:i + 1], base) for i in range(3)):.3f}")
+    worst = max(d(lg3[i:i + 1], base) for i in range(3))
+    ck("батч из одинаковых строк даёт те же логиты, что одна строка", worst < 1.0, f"макс. разница {worst:.3f}")
     ck("generate отрабатывает и возвращает строку", isinstance(probe_format(lm, lambda *a: None), str))
 
 
-def check_vectors(ck, cfg, lm, H, V, vecs):
+def check_vectors(ck, cfg, H, V, vecs):
     """Проверяет формы, нормы и ортогональность векторов и контролей.
-    Слой 0 исключён: там resid_pre — эмбеддинг одного токена перед обоими слотами, s = 0 и нормировка даёт NaN; стиринг идёт только по LAYER_RANGE.
-    """
-    L = lm.n_layers
-    ck("калибровка: [kept, слои, d] для каждого инструмента", all(a.ndim == 3 and a.shape[1] == L and a.shape == b.shape
-                                                                  and a.shape[0] >= 1 for a, b in H.values()))
-    ck("s: [слои, d] без NaN/inf", V.s.shape[0] == L and torch.isfinite(V.s).all().item())
-    ck("D_cfg: 2 порядка × 3 варианта вызова", len(V.D_cfg) == 6 and set(V.D_cfg) == {(o, lay) for o in ("od", "do") for lay in LAYOUTS})
+    Слой 0 исключён: там resid_pre — эмбеддинг одного токена перед всеми слотами, native = 0 и нормировка даёт NaN; стиринг идёт только по LAYER_RANGE."""
     lr = list(cfg.LAYER_RANGE)
-    ck("d_shuf без NaN/inf на рабочих слоях", torch.isfinite(V.d_shuf[lr]).all().item())
-    cos = torch.cosine_similarity(V.d_shuf, V.s, dim=-1)[lr].abs().max().item()
-    ck("d_shuf ортогонален s на рабочих слоях", cos < 1e-3, f"макс. |cos| {cos:.1e}")
-    ns = V.norm_s
-    worst = max((v[lr].norm(dim=-1, keepdim=True) / ns[lr] - 1).abs().max().item() for lst in vecs.values() for _, v, _ in lst)
-    ck("все векторы условий имеют норму ||s|| на рабочих слоях", worst < 1e-3, f"макс. отклонение {worst:.1e}")
-    ck("rand_unit детерминирован по seed", torch.equal(rand_unit(0, V.s, ns), rand_unit(0, V.s, ns)))
-    ck("random0 и random1 различаются", not torch.equal(rand_unit(0, V.s, ns), rand_unit(1, V.s, ns)))
-    d0 = dict((c, v) for c, v, _ in vecs[TOOLS[0]["id"]])
-    ck("steer_neg = -steer на рабочих слоях", torch.allclose(d0["steer_neg"][lr], -d0["steer"][lr]))
-    fl = next(t for t in TOOLS if t["domain"] == "flight" and t["order"] == "do" and t["layout"] == "date_mid")
-    dd_ = dict((c, v) for c, v, _ in vecs[fl["id"]])
-    e = V.e_lay["date_mid"][lr]
-    ref = ns[lr] * e * -1 / e.norm(dim=-1, keepdim=True)
-    ck("steer_pos для порядка do берётся со знаком минус", torch.allclose(dd_["steer_pos"][lr], ref, atol=1e-4 * ns[lr].max().item()))
-    ck("у рейсов 6 векторов семейства steer, у остальных 5",
-       all(len([c for c, _, _ in vecs[t["id"]] if c.startswith("steer") and c != "steer_neg"]) == (6 if t["domain"] == "flight" else 5)
-           for t in TOOLS))
-    ck("steer_dom только у message/period, steer_layout и steer_pos только у рейсов",
-       all(("steer_dom" in {c for c, _, _ in vecs[t["id"]]}) == (t["domain"] != "flight") and
-           ("steer_layout" in {c for c, _, _ in vecs[t["id"]]}) == (t["domain"] == "flight") for t in TOOLS))
+    ck("калибровка: для каждого инструмента состояния слотов 1, 3, 5 одинаковой формы [kept, слои, d]",
+       all(set(h) == set(SLOTS) and len({tuple(v.shape) for v in h.values()}) == 1 and next(iter(h.values())).ndim == 3 for h in H.values()))
+    ck("векторы заведены для каждой пары (инструмент, переход)", len(V.native) == len(V.foreign) == len(V.shuf) == len(TOOLS) * len(TRANSITIONS))
+    ck("векторы без NaN/inf на рабочих слоях", all(torch.isfinite(v[lr]).all().item() for D in (V.native, V.foreign, V.shuf) for v in D.values()))
+    ck("обратный переход равен прямому с минусом (5→3 = −(3→5), 3→1 = −(1→3))",
+       all(torch.allclose(V.native[(t["id"], (5, 3))], -V.native[(t["id"], (3, 5))]) and
+           torch.allclose(V.native[(t["id"], (3, 1))], -V.native[(t["id"], (1, 3))]) for t in TOOLS))
+    t0 = TOOLS[0]["id"]
+    ck("native = среднее состояния слота d минус слота o по примерам инструмента", torch.equal(pooled(H, [t0], 1, 3), V.native[(t0, (1, 3))]))
+    others = [t["id"] for t in TOOLS if t["id"] != t0]
+    ck("foreign = тот же переход по остальным инструментам, без своего", torch.equal(pooled(H, others, 3, 5), V.foreign[(t0, (3, 5))]))
+    ck("foreign не совпадает с native", not torch.equal(V.foreign[(t0, (3, 5))], V.native[(t0, (3, 5))]))
+    cos = max(torch.cosine_similarity(V.shuf[k], V.native[k], dim=-1)[lr].abs().max().item() for k in V.shuf)
+    ck("shuffled ортогонален своему native на рабочих слоях", cos < 1e-3, f"макс. |cos| {cos:.1e}")
+    worst = max((v[lr].norm(dim=-1) / V.native[k][lr].norm(dim=-1) - 1).abs().max().item()
+                for k, lst in vecs.items() for _, _, v, _ in lst)
+    ck("все векторы условий имеют норму своего native на рабочих слоях", worst < 1e-3, f"макс. отклонение {worst:.1e}")
+    ck("число условий на пару (инструмент, переход) = 6: свой, неродной и 4 контроля", all(len(lst) == 6 for lst in vecs.values()))
+    ck("имена условий: steer_tool_{o}_{d}, steer_foreign_{o}_{d} и контроли",
+       all([c for c, _, _, _ in vecs[(t["id"], tr)]] == [f"steer_tool_{tr[0]}_{tr[1]}", f"steer_foreign_{tr[0]}_{tr[1]}",
+                                                         "steer_neg", "shuffled", "random0", "random1"] for t in TOOLS for tr in TRANSITIONS))
+    r0 = V.native[(t0, (1, 3))]
+    ck("rand_unit детерминирован по seed", torch.equal(rand_unit(0, r0), rand_unit(0, r0)))
+    ck("random0 и random1 различаются", not torch.equal(rand_unit(0, r0), rand_unit(1, r0)))
+    d0 = {c: v for c, _, v, _ in vecs[(t0, (1, 3))]}
+    ck("steer_neg = −steer_tool на рабочих слоях", torch.allclose(d0["steer_neg"][lr], -d0["steer_tool_1_3"][lr]))
 
 
-def n_specs(cfg, vecs, dom):
-    """Число пар (условие, сила) для типа задач dom."""
-    t = next(t for t in TOOLS if t["domain"] == dom)
-    return sum(len(al) for _, _, al in vecs[t["id"]])
+def n_specs(vecs, key):
+    """Число пар (условие, сила) для ключа (инструмент, переход)."""
+    return sum(len(al) for _, _, _, al in vecs[key])
 
 
 def check_eval(ck, lm, cfg, vecs, pool):
-    """Прогоняет eval_example для каждого типа задач и проверяет вид результата."""
+    """Прогоняет eval_example для каждого инструмента и всех переходов и проверяет вид результата."""
     rnd = random.Random(123)
-    for dom in ("flight", "message", "period"):
-        t = next(t for t in TOOLS if t["domain"] == dom)
-        tpl = next(x for x in TEMPLATES if x["domain"] == dom)
-        O, D, X = rnd.sample(pool[dom]["test"], 3)
-        rows = eval_example(lm, cfg, vecs, t, tpl, O, D, X, "second")
-        S = n_specs(cfg, vecs, dom)
-        ck(f"eval_example[{dom}]: число строк = 1 + слои·(условия + patch)", len(rows) == 1 + len(cfg.LAYER_RANGE) * (S + 1),
-           f"{len(rows)} из {1 + len(cfg.LAYER_RANGE) * (S + 1)}")
-        ck(f"eval_example[{dom}]: первая строка — базовая (layer=-1, cond=none)", rows[0]["layer"] == -1 and rows[0]["cond"] == "none")
-        ck(f"eval_example[{dom}]: есть patch на каждом слое", sorted(r["layer"] for r in rows if r["cond"] == "patch") == list(cfg.LAYER_RANGE))
-        ck(f"eval_example[{dom}]: delta конечны", all(pd.notna(r["delta"]) and abs(r["delta"]) < 1e6 for r in rows))
-        ck(f"eval_example[{dom}]: top1 — не более одного из T/S/X", all(r["top1_is_T"] + r["top1_is_S"] + r["top1_is_X"] <= 1 for r in rows))
+    for i, t in enumerate(TOOLS):
+        for tr in (TRANSITIONS if i == 0 else [TRANSITIONS[i % len(TRANSITIONS)]]):
+            tpl = TEMPLATES[i % len(TEMPLATES)]
+            vals = sample_vals(t, pool, "test", rnd)
+            rows = eval_example(lm, cfg, vecs, t, tpl, tr, vals)
+            name = f"eval_example[{t['id']} {tr[0]}→{tr[1]}]"
+            exp = 1 + len(cfg.LAYER_RANGE) * (n_specs(vecs, (t["id"], tr)) + 1)
+            ck(f"{name}: число строк = 1 + слои·(условия + patch)", len(rows) == exp, f"{len(rows)} из {exp}")
+            ck(f"{name}: первая строка — базовая (layer=-1, cond=none)", rows[0]["layer"] == -1 and rows[0]["cond"] == "none")
+            ck(f"{name}: patch на каждом слое", sorted(r["layer"] for r in rows if r["kind"] == "patch") == list(cfg.LAYER_RANGE))
+            ck(f"{name}: условия steer_tool_{tr[0]}_{tr[1]} и steer_foreign_{tr[0]}_{tr[1]} присутствуют",
+               {f"steer_tool_{tr[0]}_{tr[1]}", f"steer_foreign_{tr[0]}_{tr[1]}"} <= {r["cond"] for r in rows})
+            ck(f"{name}: S и T — значения аргументов o и d", rows[0]["S"] == vals[tr[0]] and rows[0]["T"] == vals[tr[1]])
+            ck(f"{name}: delta конечны", all(pd.notna(r["delta"]) and abs(r["delta"]) < 1e6 for r in rows))
+            ck(f"{name}: top1 — не более одного из T/S/R", all(r["top1_is_T"] + r["top1_is_S"] + r["top1_is_R"] <= 1 for r in rows))
+            if tr[0] == 1:
+                ck(f"{name}: для первого аргумента контекст верен без проверки (ctx_ok)", rows[0]["ctx_ok"] is True)
 
 
 def check_outputs(ck, cfg, vecs, df, dd, summary):
-    """Проверяет созданные файлы и число строк raw.csv."""
+    """Проверяет созданные файлы и число строк raw.csv, затем анализ на реальных данных и на принудительно верных."""
     out = cfg.OUT_DIR
     for f in ["run.log", "config.json", "vectors.pt", "vector_geometry.csv", "raw.csv"]:
         ck(f"файл {f} создан", os.path.exists(f"{out}/{f}"))
-    exp = sum(n * (1 + len(cfg.LAYER_RANGE) * (n_specs(cfg, vecs, d) + 1))
-              for d, n in [("flight", cfg.N_TEST), ("message", cfg.N_TEST_DOM), ("period", cfg.N_TEST_DOM)])
+    exp = cfg.N_TEST * (1 + len(cfg.LAYER_RANGE) * (n_specs(vecs, next(iter(vecs))) + 1))
     ck("raw.csv: число строк сходится с ожидаемым", len(df) == exp and len(pd.read_csv(f"{out}/raw.csv")) == exp, f"{len(df)} из {exp}")
-    ck.warn("после фильтра base_ok остались примеры (иначе анализ на реальных данных пропущен)", dd is not None)
+    ck.warn("после фильтра base_ok и ctx_ok остались примеры (иначе анализ на реальных данных пропущен)", dd is not None)
     if dd is not None:
         check_analysis(ck, cfg, summary, "реальные данные")
     check_analysis_forced(ck, cfg, df)
@@ -180,19 +195,21 @@ def check_outputs(ck, cfg, vecs, df, dd, summary):
 def check_analysis(ck, cfg, summary, label):
     """Проверяет таблицы и графики анализа."""
     out = cfg.OUT_DIR
-    ck(f"анализ[{label}]: доли pT+pS+pX+other = 1", ((summary.pT + summary.pS + summary.pX + summary.other) - 1).abs().max() < 1e-9)
-    ck(f"анализ[{label}]: доли в [0, 1]", summary[["pT", "pS", "pX", "other"]].stack().between(0, 1).all())
-    for f in ["summary.csv", "base_rates.csv", f"cell_stats_L{cfg.L0}_A{cfg.A0}.csv", f"mcnemar_L{cfg.L0}_A{cfg.A0}.csv",
-              f"where_goes_L{cfg.L0}_A{cfg.A0}.csv"]:
+    ck(f"анализ[{label}]: доли pT+pS+pR+other = 1", ((summary.pT + summary.pS + summary.pR + summary.other) - 1).abs().max() < 1e-9)
+    ck(f"анализ[{label}]: доли в [0, 1]", summary[["pT", "pS", "pR", "other"]].stack().between(0, 1).all())
+    ck(f"анализ[{label}]: в summary есть сводные строки ALL", "ALL" in set(summary.tool_id))
+    for f in ["summary.csv", "base_rates.csv", f"cell_stats_L{cfg.L0}_A{cfg.A0}.csv", f"gap_L{cfg.L0}_A{cfg.A0}.csv",
+              f"mcnemar_L{cfg.L0}_A{cfg.A0}.csv", f"where_goes_L{cfg.L0}_A{cfg.A0}.csv"]:
         ck(f"анализ[{label}]: файл {f} создан", os.path.exists(f"{out}/{f}"))
-    ck(f"анализ[{label}]: построен хотя бы один график", any(f.endswith(".png") for f in os.listdir(out)))
+    pngs = [f for f in os.listdir(out) if f.endswith(".png")]
+    ck(f"анализ[{label}]: построены 3 графика (по слоям, по силе, неродные 3→5 и 5→3)", len(pngs) == 3, f"{pngs}")
 
 
 def check_analysis_forced(ck, cfg, df):
     """Прогоняет анализ на копии raw.csv, где все примеры считаются верными: проверка не зависит от качества модели."""
     df2 = df.copy()
     df2["base_ok"] = True
-    df2["first_ok"] = df2.first_ok.map(lambda v: None if v is None or pd.isna(v) else True)
+    df2["ctx_ok"] = True
     sub = replace(cfg, OUT_DIR=f"{cfg.OUT_DIR}/analysis_forced")
     os.makedirs(sub.OUT_DIR, exist_ok=True)
     res = analysis.analyze(sub, df2, ck.log)
