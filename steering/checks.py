@@ -96,7 +96,7 @@ def check_model(ck, lm, cfg, pool):
     dl = d(lm.model(x)[0, -1][None].float(), base)
     ck("model(x) и fwd_last согласованы по последней позиции", dl < 0.5, f"макс. разница логитов {dl:.3f}")
 
-    zero = torch.zeros(1, stx["p"].shape[-1])
+    zero = torch.zeros(1, stx["p"].shape[-1], device=lm.device)
     ck("хук steer(adds=0) не меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(adds=zero))]), base) < 1e-3)
     ck("хук steer(adds=вектор) меняет логиты", d(lm.fwd_last(x, [(RESID(l), steer(adds=stx["p"][l][None] * 0.5))]), base) > 0)
     ck("хуки снимаются после прогона", d(lm.fwd_last(x), base) < 1e-3)
