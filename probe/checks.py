@@ -281,6 +281,9 @@ def check_pairs(ck, lm, pairs):
 def check_patch(ck, lm, pairs):
     """Патч на слое 0 в отличающихся позициях воспроизводит контрфакт; патч своими же состояниями ничего не меняет;
     формула патча вдоль направления меняет только проекцию на него."""
+    if not pairs:
+        ck("патчинг: есть пара для проверки хуков", False)
+        return
     pr = pairs[0]
     rel = lambda a, b: float((a - b).abs().max() / b.abs().max())
     allpos = sorted({p for v in pr["P"].values() for p in v})

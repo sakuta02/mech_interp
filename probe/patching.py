@@ -19,12 +19,13 @@ DIR_QUESTIONS = ("Q0_marker", "Q3_ptr_pos", "Q3_ptr_role")
 
 def positions(lm, sp):
     """Токены до первого городского слота включительно, группы позиций и ответ (первый токен верного города в этом слоте).
-    Группы: slot — сам слот; cities — все токены обоих городов в сообщении; markers — токен перед каждым городом (from / to).
+    Группы (позиции по возрастанию): slot — сам слот; cities — все токены обоих городов в сообщении; markers — токен
+    перед каждым городом (from / to).
     Группа key (токены названия поля в вызове) добавляется в make_pairs по паре schema."""
     k = next(j for j, f in enumerate(sp["fields"], 1) if f["role"] in ROLES)
     ids, pos, cpos = call_ids(lm, sp, upto=k)
-    cities = [i for r in ROLES for i in range(cpos[r + "_first"], cpos[r] + 1)]
-    P = dict(slot=[pos[k]], cities=cities, markers=[cpos[r + "_first"] - 1 for r in ROLES])
+    cities = sorted(i for r in ROLES for i in range(cpos[r + "_first"], cpos[r] + 1))
+    P = dict(slot=[pos[k]], cities=cities, markers=sorted(cpos[r + "_first"] - 1 for r in ROLES))
     return ids, P, lm.enc(sp["fields"][k - 1]["written"])[0]
 
 
