@@ -3,8 +3,8 @@
 import os, random
 import numpy as np, pandas as pd, torch
 
-from data import GROUP_SPLITS, NAMES, DESCS, TEMPLATES, N_SLOTS, ROLES, make_spec
-import probes
+from data import FIT_GROUPS, GROUP_SPLITS, NAMES, DESCS, TEMPLATES, N_SLOTS, ROLES, OTHER, make_spec
+import patching, probes
 from prompts import call_ids, render_user
 
 
@@ -64,12 +64,17 @@ def check_data(ck, lm, pools):
                          all(len(t) == 1 for t in tok) and len({lm.enc(x["value"])[0] for x in f}) == 4,
                      "города из нужного split": sp["src_city"] in v["city"][s["city"]] and sp["dst_city"] in v["city"][s["city"]],
                      "названия из нужного split": src["key"] in NAMES["src"][s["name"]] and dst["key"] in NAMES["dst"][s["name"]],
-                     "описания из нужного split": src["desc"] in DESCS["src"][s["desc"]] and dst["desc"] in DESCS["dst"][s["desc"]],
+                     "описания из нужного split (у conflict — из пула другой роли)":
+                         all(x["desc"] in DESCS[x["desc_role"]][s["desc"]] for x in (src, dst)),
                      "шаблон из нужного split": next(t for t in TEMPLATES if t["id"] == sp["tpl"])["split"] == s["tpl"],
                      "first согласован с шаблоном": next(t for t in TEMPLATES if t["id"] == sp["tpl"])["first"] in (None, sp["first"]),
                      "swap: первое поле городское, записан город другой роли":
                          g != "swap" or (f[0]["role"] in ROLES and f[0]["written"] == sp["dst_city" if f[0]["role"] == "src" else "src_city"]),
-                     "не swap: записано золото": g == "swap" or all(x["written"] == x["value"] for x in f)}
+                     "не swap: записано золото": g == "swap" or all(x["written"] == x["value"] for x in f),
+                     "postfix: только postfix-шаблоны": g != "postfix" or sp["tpl_pos"] == "postfix",
+                     "conflict: описание городского поля взято у другой роли, иначе у своей":
+                         all(x["desc"] in DESCS[OTHER[x["role"]] if g == "conflict" else x["role"]][s["desc"]]
+                             for x in f if x["role"] in ROLES)}
             for k, c in conds.items():
                 bad[k] = bad.get(k, 0) + (not c)
     for k, n in bad.items():
@@ -131,14 +136,24 @@ def check_rows(ck, df, lexm, qs, cfg):
     ck("swap: поле-метка и город-метка расходятся на слоте 2 в городских первых полях", len(sw) > 0 and
        ((sw.u_src != sw.uc_src) & (sw.u_dst != sw.uc_dst)).all())
     ck("в swap нет проверки правильности и нет pointer-меток", df[df.group == "swap"].correct.all() and (df[df.group == "swap"].ptr_role == -1).all())
-    ok = df[(df.site < N_SLOTS) & (df.ptr_role >= 0) & df.correct & df.cur_city]
+    ok = df[(df.site < N_SLOTS) & (df.ptr_role >= 0) & df.correct & df.cur_city & (df.group != "conflict")]
     ck("на верных примерах pointer по роли совпадает с ролью слота", (ok.ptr_role == ok.y_role).all(), f"{len(ok)} строк")
     lk = df[(df.site >= N_SLOTS) & (df.tpl_pos == "postfix") & (df.y_role == df.first_id)]
     ck("Q0_leak: у первого города postfix-сообщения роли src и dst равновероятны (роль неизвестна по контексту)", len(lk) > 0 and 0.3 < lk.y_role.mean() < 0.7, f"доля dst {lk.y_role.mean():.2f}")
+    sl_all = df[(df.site < N_SLOTS) & (df.group != "swap")]
+    ck("dist_r > 0 ровно там, где поле роли r уже записано", all(((sl_all[f"dist_{r}"] > 0) == (sl_all[f"u_{r}"] == 1)).all() for r in ROLES))
+    e = df[df.err_slot]
+    ck("ошибочный слот: модель выбрала город другой роли", len(e) == 0 or (e.ptr_role != e.y_role).all(), f"{len(e)} слотов")
+    cf = df[(df.group == "conflict") & df.cur_city & (df.site < N_SLOTS)]
+    ck("conflict: роль по описанию противоположна роли по названию", len(cf) > 0 and (cf.desc_role != cf.y_role).all())
+    nc = df[(df.group != "conflict") & (df.site < N_SLOTS)]
+    ck("вне conflict роль по описанию совпадает с ролью поля", (nc.desc_role == nc.y_role).all())
+    ck("postfix-группа содержит только postfix-шаблоны", (df[df.group == "postfix"].tpl_pos == "postfix").all())
     ck("метки y_ord = k − 1 на слотах", (df[df.site < N_SLOTS].y_ord == df[df.site < N_SLOTS].k - 1).all())
     fs = df.groupby("ex").fit_split.nunique()
     ck("каждый пример целиком в одном split", (fs == 1).all())
-    ck("fit/val/test есть только у iid", set(df[df.group != "iid"].fit_split) == {"-"} and {"fit", "val", "test"} <= set(df[df.group == "iid"].fit_split))
+    ck("fit/val/test есть только у групп iid и postfix", set(df[~df.group.isin(FIT_GROUPS)].fit_split) == {"-"}
+       and all({"fit", "val", "test"} <= set(df[df.group == g].fit_split) for g in FIT_GROUPS))
     ck("лексическая матрица согласована со строками", lexm.shape[0] == len(df) and lexm[(df.site >= N_SLOTS).values].sum() == 0)
     for q in qs:
         n_fit, n_val = int(q["fit"].sum()), int(q["val"].sum())
@@ -218,15 +233,73 @@ def check_planted(ck, device, cfg, df, lexm, qs, H_shape):
     ck.warn("подложенный сигнал: бейзлайн по позиции не читает метку", pos.isna().all() or float(pos.iloc[0]) < 0.7)
 
 
-def check_outputs(ck, cfg, res, summ):
+def check_outputs(ck, cfg, res, pr):
     """Файлы результата и разумность итогов на реальных состояниях."""
-    for f in ("rows.csv", "probe_results.csv", "summary.csv", "probes.png", "run.log"):
+    files = ["rows.csv", "run.log"]
+    if res is not None:
+        files += ["probe_results.csv", "summary.csv", "dirs.csv"] + [f"{n}.png" for n in
+                  ("01_controls", "02_role", "03_pointer", "04_pointer_errors", "05_used", "06_used_swap", "07_used_xslot",
+                   "08_used_distance", "09_conflict", "10_saturation", "11_dirs")]
+    if pr is not None:
+        files += ["patch.csv", "patch_summary.csv"] + [f"{12 + i}_patch_{k}.png" for i, k in enumerate(pr.kind.unique())]
+    for f in files:
         ck(f"файл {f} создан", os.path.exists(f"{cfg.OUT_DIR}/{f}"))
-    nan = res[(res.probe == "logreg") & (res.set == "iid_test")].bacc.isna().sum()
-    ck.warn("в iid_test нет наборов с одним классом (bacc = NaN)", nan == 0, f"{nan} ячеек (при малой выборке это ожидаемо)")
-    q0 = res[(res.question == "Q0_marker") & (res.probe == "logreg") & (res.set == "iid_test") & (res.layer >= 0)]
-    ck.warn("Q0_marker (проверка на баг): маркер роли читается на токене города, лучший слой ≥ 0.9", len(q0) > 0 and q0.bacc.max() >= 0.9,
-            f"макс. {q0.bacc.max():.2f}" if len(q0) else "")
-    lk = res[(res.question == "Q0_leak") & (res.probe == "logreg") & (res.set == "iid_test") & (res.layer >= 0)]
-    ck.warn("Q0_leak (проверка на утечку): на токене города при postfix-маркере роль не читается, все слои ≤ 0.65", len(lk) > 0 and lk.bacc.max() <= 0.65,
-            f"макс. {lk.bacc.max():.2f}" if len(lk) else "")
+    if res is not None:
+        nan = res[(res.probe == "logreg") & (res.set == "iid_test")].bacc.isna().sum()
+        ck.warn("в iid_test нет наборов с одним классом (bacc = NaN)", nan == 0, f"{nan} ячеек (при малой выборке это ожидаемо)")
+        q0 = res[(res.question == "Q0_marker") & (res.probe == "logreg") & (res.set == "iid_test") & (res.layer >= 0)]
+        ck.warn("Q0_marker (проверка на баг): маркер роли читается на токене города, лучший слой ≥ 0.9", len(q0) > 0 and q0.bacc.max() >= 0.9,
+                f"макс. {q0.bacc.max():.2f}" if len(q0) else "")
+    if pr is not None and len(pr):
+        for k, g in [("marker", "markers"), ("city", "cities")]:
+            x = pr[(pr.kind == k) & (pr.group == g) & (pr.how == "full") & (pr.layer == 0)]
+            ck.warn(f"патч {k}/{g} на слое 0 воспроизводит контрфакт (nld ≈ 1)", len(x) == 0 or abs(x.nld.mean() - 1) < 0.05,
+                    f"nld {x.nld.mean():.2f}" if len(x) else "нет слоя 0")
+
+
+def check_pairs(ck, lm, pairs):
+    """Пары для патчинга: одинаковая длина, ответы различаются, токены различаются только там, где задумано."""
+    ck("патчинг: пары собраны", len(pairs) > 0, f"{len(pairs)}")
+    bad = {"marker": 0, "city": 0, "schema": 0}
+    for pr in pairs:
+        P, ids = pr["P"], pr["ids"]
+        for kind, (ids_c, ans_c) in pr["cfs"].items():
+            diff = {i for i, (a, b) in enumerate(zip(ids, ids_c)) if a != b}
+            if kind == "marker":
+                ok = diff == set(P["markers"])
+            elif kind == "city":
+                ok = diff and diff <= set(P["cities"])
+            else:
+                msg = min(P["markers"])
+                ok = bool(P["key"]) and set(P["key"]) <= diff and not diff & set(P["cities"] + P["markers"] + P["slot"]) and \
+                     all(i < msg or i in P["key"] for i in diff)
+            bad[kind] += not (ok and len(ids_c) == len(ids) and ans_c != pr["ans"])
+    for kind, n in bad.items():
+        ck(f"патчинг, контрфакт {kind}: та же длина, другой ответ, токены отличаются только в задуманных позициях", n == 0, f"ошибок {n}")
+
+
+def check_patch(ck, lm, pairs):
+    """Патч на слое 0 в отличающихся позициях воспроизводит контрфакт; патч своими же состояниями ничего не меняет;
+    формула патча вдоль направления меняет только проекцию на него."""
+    pr = pairs[0]
+    rel = lambda a, b: float((a - b).abs().max() / b.abs().max())
+    allpos = sorted({p for v in pr["P"].values() for p in v})
+    _, st_b = lm.run_states(lm.tensor(pr["ids"]), {p: p for p in allpos})
+    base = lm.fwd_last(lm.tensor(pr["ids"]))[0]
+    C = torch.stack([st_b[p] for p in pr["P"]["slot"]], 1)
+    same = patching.patched_last(lm, pr["ids"], [0, lm.n_layers // 2], pr["P"]["slot"], C)
+    ck("патч собственными состояниями не меняет логиты", rel(same[1], base) < 2e-2 and int(same[1].argmax()) == int(base.argmax()),
+       f"отн. разница {rel(same[1], base):.1e}")
+    for kind, grp in [("marker", "markers"), ("city", "cities")]:
+        ids_c, _ = pr["cfs"][kind]
+        lc, st = lm.run_states(lm.tensor(ids_c), {p: p for p in allpos})
+        C = torch.stack([st[p] for p in pr["P"][grp]], 1)
+        lp = patching.patched_last(lm, pr["ids"], [0], pr["P"][grp], C)[0]
+        ck(f"патч {kind}: подмена группы {grp} на слое 0 воспроизводит контрфакт", rel(lp, lc[-1].float()) < 2e-2
+           and int(lp.argmax()) == int(lc[-1].argmax()), f"отн. разница {rel(lp, lc[-1].float()):.1e}")
+    g = torch.Generator().manual_seed(0)
+    h, c, u = torch.randn(3, 16, generator=g), torch.randn(3, 16, generator=g), torch.randn(16, generator=g)
+    u = u / u.norm()
+    new = h + ((c - h) @ u)[:, None] * u
+    ck("формула патча вдоль направления: проекция берётся у контрфакта, остальное у исходного",
+       torch.allclose(new @ u, c @ u, atol=1e-5) and torch.allclose(new - (new @ u)[:, None] * u, h - (h @ u)[:, None] * u, atol=1e-5))

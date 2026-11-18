@@ -31,6 +31,10 @@ class LM:
         """Список токенов в тензор [1, T] на устройстве модели."""
         return torch.tensor([ids], device=self.device)
 
+    def fwd_last(self, x, hooks=()):
+        """Логиты последней позиции [B, V]; hooks = [(имя хука или фильтр, функция)] действуют только на этот прогон."""
+        return self.model.run_with_hooks(x, fwd_hooks=list(hooks), logits_to_keep=1, use_cache=False)[:, -1].float()
+
     def run_states(self, ids, pos, logits=True):
         """Читающим хуком берёт resid_pre всех слоёв в позициях pos; возвращает (логиты или None, {роль: [L, d]})."""
         idx = list(pos.values())

@@ -1,6 +1,6 @@
 """Данные опыта: инструмент с четырьмя полями (два городских с ролями src и dst, два посторонних), названия и описания полей,
 шаблоны сообщения и пулы однотокенных значений. Всё, что делится на train и test, задаёт отложенные наборы для проб."""
-import random
+import copy, random
 
 CITY_CANDIDATES = [
     "Paris", "London", "Berlin", "Madrid", "Rome", "Tokyo", "Moscow", "Vienna", "Prague", "Oslo",
@@ -80,11 +80,14 @@ TEMPLATES = [
     dict(id="start_end", pos="prefix", split="test", first="src"),
     dict(id="is_the", pos="postfix", split="test", first=None),
 ]
-# из какого split (train или test) берётся каждый признак примера в каждой группе
+# из какого split (train или test) берётся каждый признак примера в каждой группе;
+# postfix — только postfix-шаблоны (для контроля на утечку), conflict — описание поля взято у другой роли, swap — см. make_spec
 OOD_GROUPS = ["ood_city", "ood_name", "ood_desc", "ood_tpl", "ood_all"]
 _TR = dict(city="train", name="train", desc="train", tpl="train")
-GROUP_SPLITS = {"iid": _TR, "swap": _TR, "ood_all": {k: "test" for k in _TR},
+GROUP_SPLITS = {"iid": _TR, "swap": _TR, "postfix": _TR, "conflict": _TR, "ood_all": {k: "test" for k in _TR},
                 **{f"ood_{k}": {**_TR, k: "test"} for k in _TR}}
+FIT_GROUPS = ("iid", "postfix")     # группы, которые делятся на fit / val / test
+CF_KINDS = ("marker", "city", "schema")
 VAL_TYPES = {"city": CITY_CANDIDATES, "name": NAMES_POOL, "period": PERIODS, "color": COLORS, "animal": ANIMALS}
 
 
@@ -106,9 +109,10 @@ def build_pools(lm, log):
     return dict(vals=vals, tlen={k: len(lm.enc(k)) for k in keys})
 
 
-def make_spec(rng, pools, group):
-    """Один пример: порядок полей, названия и описания, города, посторонние значения, шаблон. swap: первое поле городское
-    и заполняется городом другой роли."""
+def make_spec(rng, pools, group, tpl_ids=None):
+    """Один пример: порядок полей, названия и описания, города, посторонние значения, шаблон.
+    swap: первое поле городское и заполняется городом другой роли; conflict: описание городского поля взято у другой роли;
+    postfix: только postfix-шаблоны; tpl_ids ограничивает выбор шаблона."""
     sp = GROUP_SPLITS[group]
     roles = ["src", "dst", "f1", "f2"]
     rng.shuffle(roles)
@@ -121,13 +125,16 @@ def make_spec(rng, pools, group):
     src_key = rng.choice([k for k in NAMES["src"][sp["name"]] if any(tl[d] == tl[k] for d in dst_keys)])
     dst_key = rng.choice([k for k in dst_keys if tl[k] == tl[src_key]])
     city = dict(zip(ROLES, rng.sample(pools["vals"]["city"][sp["city"]], 2)))
-    tpl = rng.choice([t for t in TEMPLATES if t["split"] == sp["tpl"]])
-    desc = {r: rng.choice(DESCS[r][sp["desc"]]) for r in ROLES}
+    tpls = [t for t in TEMPLATES if t["split"] == sp["tpl"] and (group != "postfix" or t["pos"] == "postfix")
+            and (tpl_ids is None or t["id"] in tpl_ids)]
+    tpl = rng.choice(tpls)
+    desc_role = {r: OTHER[r] if group == "conflict" else r for r in ROLES}
+    desc = {r: rng.choice(DESCS[desc_role[r]][sp["desc"]]) for r in ROLES}
     fl = dict(zip(["f1", "f2"], fills))
     fields = []
     for r in roles:
         if r in ROLES:
-            fields.append(dict(role=r, key=src_key if r == "src" else dst_key, desc=desc[r], value=city[r]))
+            fields.append(dict(role=r, key=src_key if r == "src" else dst_key, desc=desc[r], desc_role=desc_role[r], value=city[r]))
         else:
             f = fl[r]
             v = rng.choice(pools["vals"][f["ty"]]["train"] + pools["vals"][f["ty"]]["test"])
@@ -140,16 +147,42 @@ def make_spec(rng, pools, group):
                 src_city=city["src"], dst_city=city["dst"], name_len=tl[src_key], **{f"{k}_split": v for k, v in sp.items()})
 
 
+def counterfactual(sp, kind):
+    """Пара к примеру той же длины в токенах. marker: в сообщении from и to меняются местами, города стоят на месте
+    (только для from_to и to_from); city: города меняются местами, маркеры на месте; schema: у двух городских полей меняются
+    местами названия и описания, сообщение то же. Во всех трёх в каждый городской слот пишется другой город, чем в исходном."""
+    cf = copy.deepcopy(sp)
+    if kind in ("marker", "city"):
+        cf["src_city"], cf["dst_city"] = sp["dst_city"], sp["src_city"]
+        if kind == "marker":
+            cf["tpl"] = {"from_to": "to_from", "to_from": "from_to"}[sp["tpl"]]
+            cf["first"] = OTHER[sp["first"]]
+    else:
+        a, b = [f for f in cf["fields"] if f["role"] in ROLES]
+        a["key"], b["key"] = b["key"], a["key"]
+        a["desc"], b["desc"] = b["desc"], a["desc"]
+        for f in (a, b):
+            f["role"] = OTHER[f["role"]]
+            f["desc_role"] = f["role"]
+    for f in cf["fields"]:
+        if f["role"] in ROLES:
+            f["value"] = f["written"] = cf[f"{f['role']}_city"]
+    return cf
+
+
 def make_dataset(cfg, pools, rng):
-    """Список примеров по группам iid, ood_*, swap; в iid каждому примеру добавлено поле fit_split (fit, val, test)."""
+    """Список примеров по группам; в группах FIT_GROUPS каждому примеру добавлено поле fit_split (fit, val, test)."""
     specs = []
-    for g, n in [("iid", cfg.N_IID)] + [(g, cfg.N_OOD) for g in OOD_GROUPS] + [("swap", cfg.N_SWAP)]:
+    sizes = [("iid", cfg.N_IID)] + [(g, cfg.N_OOD) for g in OOD_GROUPS] + \
+            [("swap", cfg.N_SWAP), ("postfix", cfg.N_POSTFIX), ("conflict", cfg.N_CONFLICT)]
+    for g, n in sizes:
         specs += [make_spec(rng, pools, g) for _ in range(n)]
-    iid = [s for s in specs if s["group"] == "iid"]
-    rng.shuffle(iid)
-    a, b = int(len(iid) * cfg.FIT_FRAC[0]), int(len(iid) * (cfg.FIT_FRAC[0] + cfg.FIT_FRAC[1]))
-    for i, s in enumerate(iid):
-        s["fit_split"] = "fit" if i < a else "val" if i < b else "test"
+    for g in FIT_GROUPS:
+        part = [s for s in specs if s["group"] == g]
+        rng.shuffle(part)
+        a, b = int(len(part) * cfg.FIT_FRAC[0]), int(len(part) * (cfg.FIT_FRAC[0] + cfg.FIT_FRAC[1]))
+        for i, s in enumerate(part):
+            s["fit_split"] = "fit" if i < a else "val" if i < b else "test"
     for s in specs:
         s.setdefault("fit_split", "-")
     return specs

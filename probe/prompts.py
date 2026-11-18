@@ -28,7 +28,8 @@ def render_user(sp):
 
 
 def prompt_ids(lm, sp):
-    """Токены промпта (поля схемы идут в порядке слотов) и cpos[роль] — последний токен города в сообщении."""
+    """Токены промпта (поля схемы идут в порядке слотов) и cpos: cpos[роль] — последний токен города в сообщении,
+    cpos[роль + "_first"] — первый."""
     text, spans = render_user(sp)
     props = {f["key"]: {"type": "string", "description": f["desc"]} for f in sp["fields"]}
     schema = [{"type": "function", "function": {"name": TOOL_NAME, "description": TOOL_DESC,
@@ -37,19 +38,24 @@ def prompt_ids(lm, sp):
                                    tokenize=False, enable_thinking=False)
     enc = lm.tok(s, add_special_tokens=False, return_offsets_mapping=True)
     off = s.rindex(text)
-    cpos = {r: max(i for i, (x, y) in enumerate(enc["offset_mapping"]) if x < off + b and y > off + a)
-            for r, (a, b) in spans.items()}
+    cpos = {}
+    for r, (a, b) in spans.items():
+        toks = [i for i, (x, y) in enumerate(enc["offset_mapping"]) if x < off + b and y > off + a]
+        cpos[r], cpos[r + "_first"] = max(toks), min(toks)
     return enc["input_ids"], cpos
 
 
-def call_ids(lm, sp):
-    """Промпт и вызов с записанными значениями; pos[k] — токен перед значением поля k (1..4), cpos — токены городов."""
+def call_ids(lm, sp, upto=None):
+    """Промпт и вызов с записанными значениями; pos[k] — токен перед значением поля k (1..4), cpos — токены городов.
+    upto=k обрезает последовательность на pos[k] включительно: значение поля k и дальше не подаются."""
     ids, cpos = prompt_ids(lm, sp)
     f = sp["fields"]
     ids = ids + lm.enc(CALL_START.format(name=TOOL_NAME, key=f[0]["key"]))
     pos = {}
     for k in range(1, N_SLOTS + 1):
         pos[k] = len(ids) - 1
+        if upto == k:
+            return ids, pos, cpos
         ids += lm.enc(f[k - 1]["written"])
         if k < N_SLOTS:
             ids += lm.enc(PARAM_SEP.format(key=f[k]["key"]))

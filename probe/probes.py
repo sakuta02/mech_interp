@@ -157,3 +157,22 @@ def run_question(q, df, H, lexm, layers, cfg, rng, device, log):
         rows, _ = probe_suite(X, y, fit, val, ev, g, q["ncls"], cfg, rng, std=False, extra=False)
         res += tag([dict(r, probe=kind) for r in rows], -1)
     return res, cosl
+
+
+def make_dirs(H, df, qs, names, seed):
+    """Направления для патчинга: для каждого бинарного вопроса из names и каждого слоя — единичная разность средних классов
+    по строкам fit в исходном пространстве resid_pre (как CAA) и случайное единичное направление (контроль). Значения [L, d]."""
+    out, g = {}, torch.Generator().manual_seed(seed)
+    for name in names:
+        q = next(x for x in qs if x["name"] == name)
+        ix = np.flatnonzero(q["fit"].values)
+        ex, site = torch.as_tensor(df.ex.values[ix].copy()), torch.as_tensor(df.site.values[ix].copy())
+        y = torch.as_tensor(df[q["y"]].values[ix].copy())
+        U = []
+        for l in range(H.shape[0]):
+            X = H[l][ex, site].float()
+            d = X[y == 1].mean(0) - X[y == 0].mean(0)
+            U.append(d / d.norm().clamp(min=1e-8))
+        R = torch.randn(H.shape[0], H.shape[-1], generator=g)
+        out[name] = {"dir": torch.stack(U), "rand": R / R.norm(dim=1, keepdim=True)}
+    return out
