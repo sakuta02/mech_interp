@@ -1,5 +1,8 @@
 CLAUDE.md
+CLAUDE.md
+AGENTS.md
 .venv
 results*/
 *.zip
 __pycache__/
+run_*/
